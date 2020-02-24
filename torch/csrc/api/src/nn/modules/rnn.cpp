@@ -1,6 +1,6 @@
 #include <torch/nn/modules/rnn.h>
 
-#include <torch/nn/modules/dropout.h>
+#include <torch/nn/init.h>
 #include <torch/types.h>
 #include <torch/utils.h>
 
@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <regex>
 #include <string>
 #include <tuple>
 #include <unordered_set>
@@ -22,60 +23,168 @@ namespace nn {
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ RNNImplBase ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 namespace detail {
 template <typename Derived>
-RNNImplBase<Derived>::RNNImplBase(
-    const RNNOptionsBase& options_,
-    optional<CuDNNMode> cudnn_mode,
-    int64_t number_of_gates)
-    : options(options_),
-      number_of_gates_(number_of_gates),
-      cudnn_mode_(std::move(cudnn_mode)) {
+RNNImplBase<Derived>::RNNImplBase(RNNOptionsBase options_)
+  : options(std::move(options_)) {
   reset();
 }
 
 template <typename Derived>
 void RNNImplBase<Derived>::reset() {
-  const auto num_directions = options.bidirectional() ? 2 : 1;
+  const int64_t num_directions = options.bidirectional() ? 2 : 1;
 
-  w_ih.resize(options.layers() * num_directions);
-  w_hh.resize(options.layers() * num_directions);
-  b_ih.resize(options.layers() * num_directions);
-  b_hh.resize(options.layers() * num_directions);
+  TORCH_CHECK(
+    0 <= options.dropout() && options.dropout() <= 1,
+    "dropout should be a number in range [0, 1] ",
+    "representing the probability of an element being ",
+    "zeroed");
 
-  const int64_t gate_size = options.hidden_size() * number_of_gates_;
+  if (options.dropout() > 0 && options.num_layers() == 1) {
+    TORCH_WARN(
+      "dropout option adds dropout after all but last ",
+      "recurrent layer, so non-zero dropout expects ",
+      "num_layers greater than 1, but got dropout=", options.dropout(), " and ",
+      "num_layers=", options.num_layers());
+    )
+  }
 
-  for (int64_t layer = 0; layer < options.layers(); ++layer) {
-    for (auto direction = 0; direction < num_directions; direction++) {
-      const auto layer_input_size = layer == 0 ? options.input_size() :
-        options.hidden_size() * num_directions;
-      const auto suffix = direction == 1 ? "_reverse" : "";
-      const auto layer_idx = (layer * num_directions) + direction;
-      w_ih[layer_idx] = this->register_parameter(
-          "weight_ih_l" + std::to_string(layer) + suffix,
-          torch::empty({gate_size, layer_input_size}));
-      w_hh[layer_idx] = this->register_parameter(
-          "weight_hh_l" + std::to_string(layer) + suffix,
-          torch::empty({gate_size, options.hidden_size()}));
+  int64_t gate_size = 0;
+  if (c10::get_if<enumtype::kLSTM>(&options.mode())) {
+    gate_size = 4 * options.hidden_size();
+  } else if (c10::get_if<enumtype::kGRU>(&options.mode())) {
+    gate_size = 3 * options.hidden_size();
+  } else if (c10::get_if<enumtype::kRNN_TANH>(&options.mode())) {
+    gate_size = options.hidden_size();
+  } else if (c10::get_if<enumtype::kRNN_RELU>(&options.mode())) {
+    gate_size = options.hidden_size();
+  } else {
+    TORCH_CHECK(false, "Unrecognized RNN mode: " + torch::enumtype::get_enum_name(v));
+  }
 
-      if (options.with_bias()) {
-        b_ih[layer_idx] = this->register_parameter(
-          "bias_ih_l" + std::to_string(layer) + suffix,
-          torch::empty({gate_size}));
-        b_hh[layer_idx] = this->register_parameter(
-          "bias_hh_l" + std::to_string(layer) + suffix,
-          torch::empty({gate_size}));
+  _flat_weights_names = {};
+  _all_weights = {};
+
+  for (int64_t layer = 0; layer < num_layers; layer++) {
+    for (int64_t direction = 0; direction < num_directions; direction++) {
+      int64_t layer_input_size = layer == 0 ? options.input_size() : options.hidden_size() * num_directions;
+
+      auto w_ih = torch::empty({gate_size, layer_input_size});
+      auto w_hh = torch::empty({gate_size, hidden_size});
+      auto b_ih = torch::empty({gate_size});
+      // Second bias vector included for CuDNN compatibility. Only one
+      // bias vector is needed in standard definition.
+      auto b_hh = torch::empty({gate_size});
+      std::vector<Tensor> layer_params = {w_ih, w_hh, b_ih, b_hh};
+
+      std::string suffix = direction == 1 ? "_reverse" : "";
+      std::vector<std::string> param_names = {"weight_ih_l{layer}{suffix}", 'weight_hh_l{layer}{suffix}'};
+      if (options.bias()) {
+        param_names.emplace_back("bias_ih_l{layer}{suffix}");
+        param_names.emplace_back("bias_hh_l{layer}{suffix}");
       }
+      for (size_t i = 0; i < param_names.size(); i++) {
+        std::string x = std::regex_replace(param_names[i], std::regex("\\{layer}"), layer);
+        x = std::regex_replace(x, std::regex("\\{suffix}"), suffix);
+        param_names[i] = x;
+      }
+
+      for (size_t i = 0; i < param_names.size(); i++) {
+        auto name = param_names[i];
+        auto param = layer_params[i];
+        this->register_parameter(name, param);
+      }
+      _flat_weights_names.insert(_flat_weights_names.end(), param_names.begin(), param_names.end());
+      _all_weights.emplace_back(param_names);
     }
   }
 
-  {
-    NoGradGuard no_grad;
-    const auto stdv = 1.0 / std::sqrt(options.hidden_size());
-    for (auto& p : this->parameters()) {
-      p.uniform_(-stdv, stdv);
+  _flat_weights = {};
+  for (const auto& wn : _flat_weights_names) {
+    auto named_parameters = this->named_parameters(/*recurse=*/false);
+    if (named_parameters.contains(wn)) {
+      _flat_weights.emplace_back(named_parameters[wn]);
+    } else {
+      _flat_weights.emplace_back(Tensor());
     }
   }
 
-  flatten_parameters();
+  this->flatten_parameters();
+  this->reset_parameters(); 
+}
+
+template <typename Derived>
+void RNNImplBase<Derived>::flatten_parameters() {
+  // Resets parameter data pointer so that they can use faster code paths.
+  //
+  // Right now, this works only if the module is on the GPU and cuDNN is enabled.
+  // Otherwise, it's a no-op.
+
+  // Short-circuits if _flat_weights is only partially instantiated
+  if (_flat_weights.size() != _flat_weights_names.size()) {
+    return;
+  }
+
+  // Short-circuits if any tensor in self._flat_weights is not acceptable to cuDNN
+  // or the tensors in _flat_weights are of different dtypes
+
+  auto first_fw = _flat_weights[0];
+  auto dtype = first_fw.dtype();
+  for (const auto& fw : _flat_weights) {
+    if (!(fw.dtype() == dtype) ||
+        !fw.is_cuda() ||
+        !torch::cudnn_is_acceptable(fw)) {
+      return;
+    }
+  }
+
+  // If any parameters alias, we fall back to the slower, copying code path. This is
+  // a sufficient check, because overlapping parameter buffers that don't completely
+  // alias would break the assumptions of the uniqueness check in
+  // Module::named_parameters().
+
+  // yf225 TODO: fix the rest!
+  unique_data_ptrs = set(p.data_ptr() for p in self._flat_weights)
+  if len(unique_data_ptrs) != len(self._flat_weights):
+      return
+
+  with torch.cuda.device_of(first_fw):
+      import torch.backends.cudnn.rnn as rnn
+
+      # Note: no_grad() is necessary since _cudnn_rnn_flatten_weight is
+      # an inplace operation on self._flat_weights
+      with torch.no_grad():
+          torch._cudnn_rnn_flatten_weight(
+              self._flat_weights, (4 if self.bias else 2),
+              self.input_size, rnn.get_cudnn_mode(self.mode), self.hidden_size, self.num_layers,
+              self.batch_first, bool(self.bidirectional))
+
+
+  // yf225 TODO: old code in this function:
+
+  // Cache the flattened weight and bias vector.
+  flat_weights_ = flat_weights();
+
+  if (!cudnn_mode_ || !torch::cudnn_is_acceptable(w_ih.at(0))) {
+    return;
+  }
+
+  NoGradGuard no_grad;
+  torch::_cudnn_rnn_flatten_weight(
+      flat_weights_,
+      /*weight_stride0=*/options.with_bias() ? 4 : 2,
+      options.input_size(),
+      static_cast<int64_t>(*cudnn_mode_),
+      options.hidden_size(),
+      options.layers(),
+      /*batch_first=*/options.batch_first(),
+      /*bidirectional=*/options.bidirectional());
+}
+
+template <typename Derived>
+void RNNImplBase<Derived>::reset_parameters() {
+  const double stdv = 1.0 / std::sqrt(options.hidden_size());
+  for (auto& weight : this->parameters()) {
+    init::uniform_(weight, -stdv, stdv);
+  }
 }
 
 template <typename Derived>
@@ -119,27 +228,6 @@ void RNNImplBase<Derived>::pretty_print(std::ostream& stream) const {
          << ", hidden_size=" << options.hidden_size()
          << ", layers=" << options.layers() << ", dropout=" << options.dropout()
          << ")";
-}
-
-template <typename Derived>
-void RNNImplBase<Derived>::flatten_parameters() {
-  // Cache the flattened weight and bias vector.
-  flat_weights_ = flat_weights();
-
-  if (!cudnn_mode_ || !torch::cudnn_is_acceptable(w_ih.at(0))) {
-    return;
-  }
-
-  NoGradGuard no_grad;
-  torch::_cudnn_rnn_flatten_weight(
-      flat_weights_,
-      /*weight_stride0=*/options.with_bias() ? 4 : 2,
-      options.input_size(),
-      static_cast<int64_t>(*cudnn_mode_),
-      options.hidden_size(),
-      options.layers(),
-      /*batch_first=*/options.batch_first(),
-      /*bidirectional=*/options.bidirectional());
 }
 
 template <typename Derived>
