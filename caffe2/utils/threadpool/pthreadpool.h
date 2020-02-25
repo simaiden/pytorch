@@ -50,6 +50,15 @@ extern "C" {
 pthreadpool_t pthreadpool_create_c2(size_t threads_count);
 
 /**
+ * Queries the number of threads in a thread pool.
+ *
+ * @param[in]  threadpool  The thread pool to query.
+ *
+ * @returns  The number of threads in the thread pool.
+ */
+size_t pthreadpool_get_threads_count_c2(pthreadpool_t threadpool);
+
+/**
  * Processes items in parallel using threads from a thread pool.
  *
  * When the call returns, all items have been processed and the thread pool is
@@ -116,6 +125,16 @@ void pthreadpool_compute_4d_tiled(
     size_t tile_j,
     size_t tile_k,
     size_t tile_l);
+
+/**
+ * Terminates threads in the thread pool and releases associated resources.
+ *
+ * @warning  Accessing the thread pool after a call to this function constitutes
+ *    undefined behaviour and may cause data corruption.
+ *
+ * @param[in,out]  threadpool  The thread pool to destroy.
+ */
+void pthreadpool_destroy_c2(pthreadpool_t threadpool);
 
 #ifdef __cplusplus
 } /* extern "C" */

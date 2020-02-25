@@ -84,6 +84,7 @@ if (ANDROID_ABI)
   import_static_lib(libc10)
   import_static_lib(libnnpack)
   import_static_lib(libXNNPACK)
+  import_static_lib(libpthreadpool)
   import_static_lib(libpytorch_qnnpack)
   import_static_lib(libeigen_blas)
   import_static_lib(libcpuinfo)
@@ -100,6 +101,7 @@ if (ANDROID_ABI)
       libc10
       libnnpack
       libXNNPACK
+      libpthread
       libpytorch_qnnpack
       libeigen_blas
       libcpuinfo
@@ -116,6 +118,7 @@ else()
       c10
       nnpack
       XNNPACK
+      pthread
       pytorch_qnnpack
       cpuinfo
       clog
