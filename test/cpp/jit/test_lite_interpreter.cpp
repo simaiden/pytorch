@@ -197,7 +197,7 @@ void testLiteInterpreterQuant() {
   std::vector<IValue> inputs;
   auto minput = torch::ones({1, 2});
   inputs.emplace_back(minput);
-//  auto ref = m.run_method("forward", minput);
+  auto ref = m.run_method("forward", minput);
 
   std::stringstream ss;
   m._save_for_mobile(ss);
@@ -208,10 +208,7 @@ void testLiteInterpreterQuant() {
     res = bc.run_method("forward", bcinputs);
   }
 
-//  auto resi = res.toInt();
-//  auto refi = ref.toInt();
-//  AT_ASSERT(resi == refi);
+  AT_ASSERT(ref.toTensor().item().toFloat() == res.toTensor().item().toFloat());
 }
-} // namespace torch
 } // namespace jit
 } // namespace torch
