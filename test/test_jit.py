@@ -1787,6 +1787,36 @@ graph(%input, %weight):
         res = get_forward(m._c)(x)
         self.assertEqual(res, ref_res)
 
+    def test_swap_dequantize(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super(M, self).__init__()
+                self.maxpool = torch.nn.MaxPool2d(kernel_size=3)
+                self.avgpool = torch.nn.AdaptiveAvgPool2d((1, 1))
+
+            def forward(self, x):
+                x = torch.dequantize(x)
+                r1 = self.maxpool(x)
+                y = self.avgpool(r1)
+                return y
+        x = torch.randn([1, 3, 10, 10], dtype=torch.float)
+        x = torch.quantize_per_tensor(x, 0.5, 1, torch.quint8)
+        m = torch.jit.script(M())
+        ref_res = m(x)
+        torch._C._jit_pass_inline(m.graph)
+        FileCheck().check("aten::dequantize") \
+                   .check("aten::max_pool2d") \
+                   .check("aten::adaptive_avg_pool2d") \
+                   .run(m.graph)
+        torch._C._jit_pass_swap_dequantize(m.graph)
+        FileCheck().check("aten::max_pool2d") \
+                   .check("aten::adaptive_avg_pool2d") \
+                   .check("dequantize") \
+                   .run(m.graph)
+        res = get_forward(m._c)(x)
+        self.assertEqual(res, ref_res)
+
+
 
     def test_pattern_based_rewrite(self):
         # mul(mul(mul(mul(x,y),z),x),y) --> mul(mul(mulmul(x,y,z), x), y) -->
