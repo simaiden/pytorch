@@ -233,12 +233,14 @@ def heavy_rpc(tensor):
         tensor /= i + 1
     return 0
 
+
 @torch.jit.script
 def heavy_rpc_torchscript(tensor):
     for i in range(1, 100):
         tensor *= i
         tensor /= i + 1
     return 0
+
 
 def raise_func():
     raise ValueError("Expected error")
@@ -255,7 +257,6 @@ def set_global_rref(rref):
 def clear_global_rref():
     global global_rref
     global_rref = None
-
 
 
 # load_tests from common_utils is used to automatically filter tests for
@@ -852,7 +853,9 @@ class RpcTest(RpcAgentTestFixture):
 
     @dist_init
     def test_stress_heavy_rpc_torchscript(self):
-        self._stress_test_rpc(heavy_rpc_torchscript, repeat=20, args=(torch.ones(100, 100),))
+        self._stress_test_rpc(
+            heavy_rpc_torchscript, repeat=20, args=(torch.ones(100, 100),)
+        )
 
     @dist_init
     def test_builtin_remote_ret(self):
