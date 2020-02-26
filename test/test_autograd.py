@@ -12,6 +12,7 @@ from itertools import product
 from operator import mul
 from functools import reduce
 import torch
+import threading
 
 # TODO: remove this global setting
 # Autograd tests use double as the default dtype
@@ -2591,6 +2592,10 @@ class TestAutograd(TestCase):
             self.assertEqual(info.name, expected_name)
             last_end = info.cpu_interval.end
 
+    def verify_function_recorded(self, function_events, function_name, count=1):
+        name_events = [event for event in function_events if function_name in event.name][0]
+        self.assertEqual(name_events.count, count)
+
     def test_record_function_callbacks(self):
         x = torch.randn(10, 10)
         with profile() as p:
@@ -2600,9 +2605,54 @@ class TestAutograd(TestCase):
             # ensure that we run destructor for RecordFunction, which invokes
             # end callbacks
             del rf
-        function_events = p.function_events
-        foo_event = [event for event in function_events if "foo" in event.name][0]
-        self.assertEqual(foo_event.count, 1)
+
+        self.verify_function_recorded(p.function_events, "foo")
+
+    def test_record_function_async(self):
+        def end_record_function(rf):
+            rf.end()
+
+        x = torch.randn(10, 10)
+        with profile() as p:
+            rf = torch.autograd._RecordFunctionAsync()
+            torch.autograd._run_before_callbacks(rf, "foo")
+            y = x * 2 + 4
+            # Exit RecordFunctionAsync scope.
+            rf.exit_scope()
+            # Verify that we can end() the RecordFunctionAsnc from a separate 
+            # thread and ensure it shows up in the profile.
+            t = threading.Thread(target=end_record_function, args=(rf,))
+            t.start()
+            t.join()
+
+        self.verify_function_recorded(p.function_events, "foo")
+
+    def test_record_function_async_with_scopes(self):
+        x = torch.randn(10, 10)
+        with profile() as p:
+            with record_function("outer"):
+                y = x * 2 + 4
+                with record_function("inner"):
+                    rf = torch.autograd._RecordFunctionAsync()
+                    torch.autograd._run_before_callbacks(rf, "foo")
+                    # Exit RecordFunctionAsync scope
+                    rf.exit_scope()
+                    rf.end()
+
+        events = p.function_events
+
+        start_order = [
+            "profiler::_record_function_enter",
+            "outer",
+            "mul",
+            "add",
+            "profiler::_record_function_enter",
+            "inner",
+            "foo",
+            "profiler::_record_function_exit",
+            "profiler::_record_function_exit",
+        ]
+        self.verify_expected_order(start_order, events)
 
     def test_profiler_aggregation_fake(self):
         events = EventList()
@@ -2729,6 +2779,11 @@ class TestAutograd(TestCase):
             with tempfile.NamedTemporaryFile() as trace_file:
                 prof.export_chrome_trace(trace_file.name)
 
+    def verify_expected_order(self, order, function_events):
+        self.assertEqual(len(order), len(function_events))
+        for event, expected_name in zip(function_events, order):
+            self.assertEqual(event.name, expected_name)
+
     def test_record_function(self):
         x = torch.randn(10, 10)
 
@@ -2757,9 +2812,7 @@ class TestAutograd(TestCase):
             'profiler::_record_function_exit',
             'div',
         ]
-        self.assertEqual(len(events), len(start_order))
-        for info, expected_name in zip(events, start_order):
-            self.assertEqual(info.name, expected_name)
+        self.verify_expected_order(start_order, events)
 
         def count_events_before(before, target):
             matches = [e for e in events if e.name == before]

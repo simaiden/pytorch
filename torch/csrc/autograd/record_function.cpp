@@ -215,13 +215,20 @@ RecordFunction::~RecordFunction() {
   }
 }
 
+void RecordFunction::runEndCallbacks() {
+  TORCH_INTERNAL_ASSERT(
+      initialized_,
+      "Cannot run end callbacks on an uninitialized RecordFunction.");
+  for (size_t idx = 0; idx < manager().end_callbacks.size(); ++idx) {
+    if (!manager().is_callback_sampled[idx] || run_sampled_) {
+      manager().end_callbacks[idx](*this);
+    }
+  }
+}
+
 void RecordFunction::end() {
   if (initialized_) {
-    for (size_t idx = 0; idx < manager().end_callbacks.size(); ++idx) {
-      if (!manager().is_callback_sampled[idx] || run_sampled_) {
-        manager().end_callbacks[idx](*this);
-      }
-    }
+    runEndCallbacks();
 
     // In the case that RecordFunction::end is called from a different thread,
     // thread_local_func will not be this, so assert that we have overridden the
@@ -240,6 +247,47 @@ void RecordFunction::end() {
 
 RecordFunction* RecordFunction::current() {
   return thread_local_func_;
+}
+
+void RecordFunctionAsync::before(const char* name, int64_t sequence_nr) {
+  RecordFunction::before(name, sequence_nr);
+  RecordFunction::setThreadId();
+}
+
+void RecordFunctionAsync::before(std::string name, int64_t sequence_nr) {
+  RecordFunction::before(name, sequence_nr);
+  RecordFunction::setThreadId();
+}
+
+void RecordFunctionAsync::before(Node* fn, int64_t sequence_nr) {
+  RecordFunction::before(fn, sequence_nr);
+  RecordFunction::setThreadId();
+}
+
+void RecordFunctionAsync::exitScope() {
+  // We should not be calling exitScope() on an uninitialized RecordFunction.
+  TORCH_INTERNAL_ASSERT(
+      initialized_, "Current RecordFunction is not initialized.")
+  // If the current RecordFunction is not the stored thread_local
+  // RecordFunction, the scoping is in a bad state.
+  TORCH_INTERNAL_ASSERT(
+      thread_local_func_ == this, name_, ": must be top of stack.");
+  // Resets the thread_local func to the parent_ RecordFunction that outlives
+  // this RecordFunction, to correctly keep track of scopes.
+  thread_local_func_ = parent_;
+}
+
+void RecordFunctionAsync::end() {
+  if (initialized_) {
+    runEndCallbacks();
+    initialized_ = false;
+  }
+}
+
+// toggle initialized so that RecordFunction destructor does not attempt to
+// reinvoke callbacks.
+RecordFunctionAsync::~RecordFunctionAsync() {
+  initialized_ = false;
 }
 
 } // namespace profiler
