@@ -27,6 +27,8 @@ std::shared_ptr<Operator> matchBuiltinOp(
     const py::args& args,
     const py::kwargs& kwargs,
     Stack& stack) {
+  // Acquire GIL for py::args and py::kwargs processing.
+  pybind11::gil_scoped_acquire ag;
   Symbol symbol = Symbol::fromQualString(opName);
   if (symbol.is_aten()) {
     for (const auto& op : torch::jit::getAllOperatorsFor(symbol)) {
